@@ -1,0 +1,25 @@
+# Web framework
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.6
+
+# Image processing
+pillow>=10.2.0
+numpy>=1.26.0
+
+# Video processing
+opencv-python>=4.9.0
+
+# MLX SAM3 for Apple Silicon
+# Install from GitHub:
+# pip install -e git+https://github.com/Deekshith-Dade/mlx_sam3.git#egg=sam3
+
+# Or clone and install:
+# git clone https://github.com/Deekshith-Dade/mlx_sam3.git
+# cd mlx_sam3 && pip install -e .
+
+# MLX framework (Apple Silicon)
+mlx>=0.21.0
+
+# Development
+python-dotenv>=1.0.0
