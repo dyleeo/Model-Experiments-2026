@@ -26,6 +26,7 @@ vite.config.ts.timestamp-*
 /worker-configuration.d.ts
 
 # Python
+.venv-yolo/
 python/.venv/
 python/checkpoints/
 __pycache__/

@@ -1,5 +1,7 @@
 <script>
 	import { onMount } from 'svelte';
+	import { base } from '$app/paths';
+	import * as yolo from '$lib/yoloInference.js';
 
 	// Model state
 	let modelLoaded = $state(false);
@@ -7,6 +9,8 @@
 	let modelError = $state(null);
 	let webgpuSupported = $state(null);
 	let selectedModel = $state('yolov8n'); // n, s, m, l, x
+	/** True when ONNX model loaded; false = use mock or show error */
+	let useRealModel = $state(false);
 
 	// Video/webcam state
 	let videoRef = $state(null);
@@ -32,29 +36,7 @@
 		{ id: 'yolov8l', name: 'YOLOv8l', size: '87MB', speed: 'Slower' }
 	];
 
-	// COCO classes (subset for display)
-	const cocoClasses = [
-		'person',
-		'bicycle',
-		'car',
-		'motorcycle',
-		'airplane',
-		'bus',
-		'train',
-		'truck',
-		'boat',
-		'traffic light',
-		'fire hydrant',
-		'stop sign',
-		'parking meter',
-		'bench',
-		'bird',
-		'cat',
-		'dog',
-		'horse',
-		'sheep',
-		'cow'
-	];
+	const cocoClasses = yolo.COCO_CLASSES;
 
 	onMount(async () => {
 		// Check WebGPU support
@@ -73,13 +55,27 @@
 	async function loadModel() {
 		isLoadingModel = true;
 		modelError = null;
+		useRealModel = false;
 
 		try {
-			// Simulated model loading - in production this would load ONNX model
-			await new Promise((resolve) => setTimeout(resolve, 1500));
+			await yolo.loadModel(selectedModel, base);
 			modelLoaded = true;
+			useRealModel = yolo.isLoaded();
+			if (useRealModel) modelError = null;
+			else modelError = 'Model failed to load.';
 		} catch (e) {
-			modelError = e.message;
+			const msg = e?.message || String(e);
+			console.warn('YOLO load error:', e);
+			const is404 = msg.includes('404') || (msg.includes('fetch') && msg.toLowerCase().includes('onnx'));
+			if (is404) {
+				modelLoaded = true;
+				useRealModel = false;
+				const size = selectedModel.replace('yolov8', '') || 'n';
+				modelError = `${selectedModel}.onnx not found. Export it: cd python && python3 scripts/export_yolov8_onnx.py ${size}`;
+			} else {
+				modelLoaded = false;
+				modelError = msg;
+			}
 		} finally {
 			isLoadingModel = false;
 		}
@@ -95,6 +91,7 @@
 				await videoRef.play();
 				useWebcam = true;
 				isStreaming = true;
+				mockDetectionFrameCounter = 0;
 				startDetectionLoop();
 			}
 		} catch (e) {
@@ -124,17 +121,29 @@
 		videoRef.play();
 		useWebcam = false;
 		isStreaming = true;
+		mockDetectionFrameCounter = 0;
 		startDetectionLoop();
 	}
 
 	let animationId = null;
 	let lastTime = performance.now();
 	let frameCount = 0;
+	let mockDetectionFrameCounter = 0;
+	const MOCK_REFRESH_INTERVAL = 30;
+	// Run real model every N frames; never block the loop on inference (keeps 60fps, no backlog)
+	const REAL_INFERENCE_INTERVAL = 2;
+	let realModelFrameCounter = 0;
+	let inferenceInFlight = false;
 
 	function startDetectionLoop() {
 		if (!modelLoaded) return;
 
 		isDetecting = true;
+		if (!useRealModel) {
+			detections = generateMockDetections();
+		}
+		realModelFrameCounter = 0;
+		inferenceInFlight = false;
 
 		function detectFrame() {
 			if (!isStreaming) {
@@ -144,45 +153,73 @@
 
 			const now = performance.now();
 			frameCount++;
-
-			// Update FPS every second
 			if (now - lastTime >= 1000) {
 				fps = frameCount;
 				frameCount = 0;
 				lastTime = now;
 			}
 
-			// Simulate detection - in production this would run ONNX inference
-			const startInference = performance.now();
+			if (useRealModel && videoRef?.videoWidth) {
+				realModelFrameCounter++;
+				const shouldRunInference =
+					!inferenceInFlight && realModelFrameCounter >= REAL_INFERENCE_INTERVAL;
+				if (shouldRunInference) {
+					realModelFrameCounter = 0;
+					inferenceInFlight = true;
+					yolo
+						.detect(videoRef, confidenceThreshold)
+						.then(({ detections: result, inferenceMs }) => {
+							detections = result;
+							inferenceTime = inferenceMs;
+						})
+						.catch((e) => console.warn('Inference error:', e))
+						.finally(() => {
+							inferenceInFlight = false;
+						});
+				}
+			} else {
+				mockDetectionFrameCounter++;
+				if (mockDetectionFrameCounter >= MOCK_REFRESH_INTERVAL) {
+					mockDetectionFrameCounter = 0;
+					detections = generateMockDetections();
+				}
+				inferenceTime = 0;
+			}
 
-			// Generate mock detections
-			detections = generateMockDetections();
-
-			inferenceTime = Math.round(performance.now() - startInference);
-
-			// Draw detections on canvas
 			drawDetections();
-
 			animationId = requestAnimationFrame(detectFrame);
 		}
 
 		detectFrame();
 	}
 
+	function getVideoDimensions() {
+		if (videoRef?.videoWidth && videoRef?.videoHeight) {
+			return { w: videoRef.videoWidth, h: videoRef.videoHeight };
+		}
+		return { w: 640, h: 480 };
+	}
+
 	function generateMockDetections() {
-		// Simulate detected objects with random positions
+		const { w, h } = getVideoDimensions();
+		// Use video dimensions so bboxes stay in frame; stable-ish positions
+		const margin = Math.min(w, h) * 0.1;
+		const maxW = Math.max(60, w * 0.25);
+		const maxH = Math.max(60, h * 0.25);
 		const numDetections = Math.floor(Math.random() * 3) + 1;
 		const results = [];
 
 		for (let i = 0; i < numDetections; i++) {
+			const width = 60 + Math.random() * (maxW - 60);
+			const height = 60 + Math.random() * (maxH - 60);
 			results.push({
 				class: cocoClasses[Math.floor(Math.random() * cocoClasses.length)],
 				confidence: 0.7 + Math.random() * 0.25,
 				bbox: {
-					x: Math.random() * 400 + 50,
-					y: Math.random() * 300 + 50,
-					width: 80 + Math.random() * 100,
-					height: 80 + Math.random() * 100
+					x: margin + Math.random() * (w - margin * 2 - width),
+					y: margin + Math.random() * (h - margin * 2 - height),
+					width,
+					height
 				}
 			});
 		}
@@ -194,37 +231,51 @@
 		if (!canvasRef || !videoRef) return;
 
 		const ctx = canvasRef.getContext('2d');
-		canvasRef.width = videoRef.videoWidth || 640;
-		canvasRef.height = videoRef.videoHeight || 480;
+		const cw = videoRef.videoWidth || 640;
+		const ch = videoRef.videoHeight || 480;
+		canvasRef.width = cw;
+		canvasRef.height = ch;
 
-		ctx.clearRect(0, 0, canvasRef.width, canvasRef.height);
+		ctx.clearRect(0, 0, cw, ch);
+
+		const labelHeight = 20;
+		const labelPad = 4;
 
 		detections.forEach((det, i) => {
 			const colors = ['#4facfe', '#f093fb', '#4ade80', '#f59e0b', '#f87171'];
 			const color = colors[i % colors.length];
+			const { x, y, width, height } = det.bbox;
+
+			// Clamp bbox to canvas (in case of coordinate drift)
+			const x1 = Math.max(0, Math.min(x, cw - 2));
+			const y1 = Math.max(0, Math.min(y, ch - 2));
+			const w = Math.max(1, Math.min(width, cw - x1));
+			const h = Math.max(1, Math.min(height, ch - y1));
 
 			// Draw bounding box
 			ctx.strokeStyle = color;
 			ctx.lineWidth = 2;
-			ctx.strokeRect(det.bbox.x, det.bbox.y, det.bbox.width, det.bbox.height);
+			ctx.strokeRect(x1, y1, w, h);
 
 			// Draw segmentation mask (simulated)
 			if (showSegmentation) {
 				ctx.fillStyle = color + '40'; // 25% opacity
-				ctx.fillRect(det.bbox.x, det.bbox.y, det.bbox.width, det.bbox.height);
+				ctx.fillRect(x1, y1, w, h);
 			}
 
-			// Draw label
+			// Draw label above the box, or below if not enough room at top
 			if (showLabels) {
 				const label = `${det.class} ${(det.confidence * 100).toFixed(0)}%`;
 				ctx.font = '14px sans-serif';
 				const textWidth = ctx.measureText(label).width;
+				const labelW = textWidth + labelPad * 2;
+				const labelY = y1 - labelHeight < 0 ? y1 + h : y1 - labelHeight;
+				const textY = labelY + labelHeight - 6;
 
 				ctx.fillStyle = color;
-				ctx.fillRect(det.bbox.x, det.bbox.y - 20, textWidth + 8, 20);
-
+				ctx.fillRect(x1, labelY, labelW, labelHeight);
 				ctx.fillStyle = 'white';
-				ctx.fillText(label, det.bbox.x + 4, det.bbox.y - 6);
+				ctx.fillText(label, x1 + labelPad, textY);
 			}
 		});
 	}
@@ -305,7 +356,15 @@
 				<div class="model-ready">
 					<span class="check">✓</span>
 					{selectedModel} loaded
+					{#if useRealModel}
+						<span class="model-badge">real inference</span>
+					{:else}
+						<span class="model-badge demo">demo (no model file)</span>
+					{/if}
 				</div>
+			{/if}
+			{#if modelError}
+				<p class="model-error">{modelError}</p>
 			{/if}
 		</section>
 
@@ -625,6 +684,30 @@
 		gap: 0.5rem;
 		color: #4ade80;
 		font-weight: 500;
+		flex-wrap: wrap;
+	}
+
+	.model-badge {
+		font-size: 0.7rem;
+		background: rgba(74, 222, 128, 0.2);
+		color: #4ade80;
+		padding: 0.2rem 0.5rem;
+		border-radius: 4px;
+	}
+
+	.model-badge.demo {
+		background: rgba(248, 113, 113, 0.2);
+		color: #f87171;
+	}
+
+	.model-error {
+		margin: 0.75rem 0 0;
+		padding: 0.75rem;
+		background: rgba(248, 113, 113, 0.15);
+		border: 1px solid rgba(248, 113, 113, 0.4);
+		border-radius: 8px;
+		color: #fca5a5;
+		font-size: 0.875rem;
 	}
 
 	.check {
